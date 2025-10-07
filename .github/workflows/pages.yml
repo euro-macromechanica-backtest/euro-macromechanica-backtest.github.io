@@ -1,0 +1,333 @@
+name: Build & Deploy site from results
+
+on:
+  repository_dispatch:
+    types: [sync-readme]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-deploy
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source repo (results) with LFS
+        uses: actions/checkout@v4
+        with:
+          repository: euro-macromechanica-backtest/results
+          path: src
+          token: ${{ secrets.SYNC_TOKEN }}
+          lfs: true
+
+      - name: Prepare content
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf site _site
+          mkdir -p site/assets site/_layouts site/ru
+
+          printf '%s\n' '---' 'title: Euro Macromechanica Backtest - Results' 'layout: app' 'lang: en' '---' '' > site/index.md
+          cat src/README.md >> site/index.md
+
+          RU_SRC=""
+          if [ -f src/README.ru.md ]; then RU_SRC="src/README.ru.md"; fi
+          if [ -z "$RU_SRC" ] && [ -f src/README_RU.md ]; then RU_SRC="src/README_RU.md"; fi
+          if [ -n "$RU_SRC" ]; then
+            printf '%s\n' '---' 'title: Euro Macromechanica Backtest — RU' 'layout: app' 'lang: ru' '---' '' > site/ru/index.md
+            cat "$RU_SRC" >> site/ru/index.md
+          fi
+          python3 - <<'PY'
+          import re, io, os
+
+          def process(path):
+              if not os.path.isfile(path):
+                  return
+              t = io.open(path, "r", encoding="utf-8").read()
+
+              # blank line after front matter
+              t = re.sub(r'^(---\n.*?\n---\n)(?!\n)', r'\1\n', t, flags=re.S)
+
+              # allow markdown inside wrappers like <div align="center">…</div>
+              def add_md_attr(m):
+                  tag, attrs = m.group(1), m.group(2) or ''
+                  if 'markdown=' in (attrs or '').lower():
+                      return m.group(0)
+                  return f'<{tag}{attrs} markdown="1">'
+              t = re.sub(r'<(div|section|article)(\s[^>]*)?>', add_md_attr, t, flags=re.I)
+
+              # ensure wrappers are on their own lines (не трогаем содержимое)
+              t = re.sub(r'[ \t]*\n?(<(?:div|section|article)\b[^>]*>)\s*', r'\n\1\n', t, flags=re.I)
+              t = re.sub(r'\s*(</(?:div|section|article)\s*>)\s*\n?', r'\n\1\n', t, flags=re.I)
+
+              # keep an empty line between empty anchor and a heading
+              t = re.sub(r'(^<a[^>]*>\s*</a>\s*)(?=#+\s)', r'\1\n', t, flags=re.M)
+
+              # escape ' > ' only inside heading lines
+              def fix_heading(m):
+                  return re.sub(r'\s>\s', ' &gt; ', m.group(0))
+              t = re.sub(r'^[ \t]*#{1,6}[^\n]*', fix_heading, t, flags=re.M)
+
+              # ВАЖНО: НИКАКОЙ конвертации $$…$$ или \[ … \] тут больше нет.
+              io.open(path, "w", encoding="utf-8").write(t)
+
+          process("site/index.md")
+          process("site/ru/index.md")
+          PY
+
+          python3 - <<'PY'
+          import re, os
+          def rewrite_rel_to_root(md_path):
+              if not os.path.isfile(md_path): return
+              s=open(md_path,'r',encoding='utf-8').read()
+              def fix_md(m):
+                  url=m.group(1).strip()
+                  if url.startswith(('http://','https://','mailto:','#','/')): return m.group(0)
+                  new='/' + url.lstrip('./')
+                  return m.group(0).replace(m.group(1), new)
+              s=re.sub(r'!\[[^\]]*\]\(([^)]+)\)', fix_md, s)
+              s=re.sub(r'\[[^\]]*\]\(([^)]+)\)', fix_md, s)
+              def fix_html(m):
+                  url=m.group(1).strip()
+                  if url.startswith(('http://','https://','mailto:','#','/')): return m.group(0)
+                  new='/' + url.lstrip('./')
+                  return m.group(0).replace(m.group(1), new)
+              s=re.sub(r'<img[^>]*src=["\']([^"\']+)["\']', fix_html, s, flags=re.I)
+              s=re.sub(r'<a[^>]*href=["\']([^"\']+)["\']', fix_html, s, flags=re.I)
+              open(md_path,'w',encoding='utf-8').write(s)
+
+          rewrite_rel_to_root("site/ru/index.md")
+          PY
+
+          python3 - <<'PY'
+          import re, os, shutil
+          SRC='src'; DST='site'
+          pages=['site/index.md']
+          if os.path.isfile('site/ru/index.md'): pages.append('site/ru/index.md')
+          text=''.join(open(p,'r',encoding='utf-8').read() for p in pages)
+          paths=set()
+          paths.update(re.findall(r'!\[[^\]]*\]\(([^)]+)\)', text))
+          paths.update(re.findall(r'\[[^\]]*\]\(([^)]+)\)', text))
+          paths.update(re.findall(r'<img[^>]*src=["\']([^"\']+)["\']', text, flags=re.I))
+          paths.update(re.findall(r'<a[^>]*href=["\']([^"\']+)["\']', text, flags=re.I))
+          def is_rel(p):
+              if not p: return False
+              p=p.strip()
+              return not p.startswith(('http://','https://','mailto:','#','/'))
+          rels=[]; seen=set()
+          for p in paths:
+              p=p.split('#')[0].split('?')[0].strip()
+              if p.startswith('/'): p=p.lstrip('/')
+              if is_rel(p) and p not in seen:
+                  seen.add(p); rels.append(p)
+          for r in rels:
+              s=os.path.join(SRC,r); d=os.path.join(DST,r)
+              if os.path.isdir(s):
+                  for root,_,files in os.walk(s):
+                      relroot=os.path.relpath(root,SRC)
+                      for fn in files:
+                          ss=os.path.join(root,fn)
+                          dd=os.path.join(DST,relroot,fn)
+                          os.makedirs(os.path.dirname(dd), exist_ok=True)
+                          shutil.copy2(ss,dd)
+              elif os.path.isfile(s):
+                  os.makedirs(os.path.dirname(d) or '.', exist_ok=True)
+                  shutil.copy2(s,d)
+          for r in rels:
+              if r.lower().endswith('.md'):
+                  p=os.path.join(DST,r)
+                  if os.path.isfile(p):
+                      with open(p,'r',encoding='utf-8') as f:
+                          head=f.read(4)
+                      if head!='---\n':
+                          body=open(p,'r',encoding='utf-8').read()
+                          open(p,'w',encoding='utf-8').write('---\nlayout: default\n---\n\n'+body)
+          PY
+
+          CSS_FILE="site/assets/site.css"
+          : > "$CSS_FILE"
+          printf '%s\n' \
+            ':root{--gh-canvas:#0d1117;--gh-canvas-subtle:#161b22;--gh-fg:#c9d1d9;--gh-fg-muted:#8b949e;--gh-border:#30363d;--gh-link:#58a6ff;--gh-link-hover:#79c0ff;--gh-heading:#e6edf3;--gh-heading-hover:#d1d7de;--gh-code-bg:#161b22;}' \
+            'html{color-scheme:dark;background:var(--gh-canvas)!important;}' \
+            'html,body,main,.page-content,.main-content{background:var(--gh-canvas)!important;color:var(--gh-fg);}' \
+            '.main-content,.page-content,.container,.wrapper,.inner{max-width:100%!important;width:100%!important;}' \
+            '.main-content{padding:24px!important;}' \
+            'h1,h2,h3,h4,h5,h6{color:var(--gh-heading)!important;}' \
+            'h1 a,h2 a,h3 a,h4 a,h5 a,h6 a{color:var(--gh-heading)!important;text-decoration:none;border-bottom:1px solid transparent;}' \
+            'h1 a:hover,h2 a:hover,h3 a:hover,h4 a:hover,h5 a:hover,h6 a:hover{color:var(--gh-heading-hover)!important;border-bottom-color:var(--gh-heading-hover);}' \
+            'a{color:var(--gh-link);} a:hover{color:var(--gh-link-hover);}' \
+            'p,li{color:var(--gh-fg);}' \
+            'img,video{max-width:100%;height:auto;}' \
+            'table{display:block;width:100%;overflow-x:auto;border-color:var(--gh-border);}' \
+            'th,td{border-color:var(--gh-border)!important;}' \
+            'thead th{background:var(--gh-canvas-subtle);}' \
+            'pre,code{background:var(--gh-code-bg)!important;color:var(--gh-fg)!important;border:1px solid var(--gh-border);}' \
+            'pre{padding:12px;border-radius:6px;}' \
+            'code{padding:.2em .4em;border-radius:4px;}' \
+            'hr{border-color:var(--gh-border);}' \
+            '::selection{background:rgba(110,118,129,.35);}' \
+            'a:focus,button:focus,[role="button"]:focus{outline:2px solid #1f6feb;outline-offset:2px;}' \
+            'body{scrollbar-color:#2b3138 var(--gh-canvas);scrollbar-width:thin;}' \
+            '*::-webkit-scrollbar{width:12px;height:12px;}' \
+            '*::-webkit-scrollbar-track{background:var(--gh-canvas);}' \
+            '*::-webkit-scrollbar-thumb{background:#2b3138;border:2px solid var(--gh-canvas);border-radius:8px;}' \
+            '*::-webkit-scrollbar-thumb:hover{background:#38414a;}' \
+            '.site-footer{background:var(--gh-canvas);border-top:1px solid var(--gh-border);color:var(--gh-fg-muted);text-align:center;font-size:.95rem;padding:16px 0 24px;}' \
+            '.site-footer a{color:var(--gh-link);} .site-footer a:hover{color:var(--gh-link-hover);}' \
+            '.lang-nav{display:flex;justify-content:center;gap:10px;padding:12px 0 0;}' \
+            '.lang-nav .pill{display:inline-flex;align-items:center;padding:6px 12px;border:1px solid var(--gh-border);border-radius:999px;background:var(--gh-canvas-subtle);color:var(--gh-fg-muted);text-decoration:none;font-weight:500;}' \
+            '.lang-nav .pill:hover{color:var(--gh-heading);border-color:var(--gh-link);}' \
+            '.lang-nav .pill.active{background:transparent;color:var(--gh-heading);border-color:var(--gh-heading);}' \
+            '[align="center"]{text-align:center;}' \
+            'em,i{font-style:normal;}' \
+            >> "$CSS_FILE"
+
+          mkdir -p site/assets/katex
+          curl -fsSL https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js  -o site/assets/katex/katex.min.js
+          curl -fsSL https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css -o site/assets/katex/katex.min.css
+
+          python3 - <<'PY'
+          html = """<!DOCTYPE html>
+          <html lang="{{ page.lang | default: 'en' }}">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>{{ page.title | escape }}</title>
+            <link rel="stylesheet" href="{{ '/assets/css/style.css?v=' | append: site.github.build_revision | relative_url }}">
+            <link rel="stylesheet" href="{{ '/assets/site.css' | relative_url }}?v={{ site.github.build_revision | default: site.time | date: '%s' }}">
+            <link rel="stylesheet" href="{{ '/assets/katex/katex.min.css' | relative_url }}">
+          </head>
+          <body>
+            <nav class="lang-nav">
+              <a class="pill {% if page.lang == 'en' %}active{% endif %}" href="{{ '/'   | relative_url }}">EN</a>
+              <a class="pill {% if page.lang == 'ru' %}active{% endif %}" href="{{ '/ru/' | relative_url }}">RU</a>
+            </nav>
+
+            <main class="page-content" aria-label="Content">
+              <div class="main-content" role="main">
+                {{ content }}
+              </div>
+            </main>
+
+            <footer class="site-footer">© {{ "now" | date: "%Y" }} Euro Macromechanica (EMM) Backtest · by <a href="https://github.com/rleydev">thelaziestcat (rleydev)</a></footer>
+
+            <script src="{{ '/assets/katex/katex.min.js' | relative_url }}" defer></script>
+            <script>
+              (function(){
+                function isTexLike(s){
+                  return /\\\\[a-zA-Z]+|\\\\frac|\\\\sqrt|\\\\left|\\\\right|[_^]|\\\\{|\\\\}/.test(s);
+                }
+                function boundaryOK(text, start, end){
+                  var before = start === 0 ? ' ' : text[start-1];
+                  var after  = end   >= text.length ? ' ' : text[end];
+                  return /[\\s(]|^/.test(before) && /[\\s).,;:!?]|$/.test(after);
+                }
+                function renderKatexInText(root){
+                  if (!window.katex) return;
+                  var scope = root || document.body;
+                  var SKIP = {SCRIPT:1,STYLE:1,TEXTAREA:1,PRE:1,CODE:1,KBD:1,SAMP:1};
+                  var walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT, {
+                    acceptNode: function(n){
+                      if (!n.nodeValue) return NodeFilter.FILTER_REJECT;
+                      if (!(/\\$\\$|\\\\\\[|\\[/.test(n.nodeValue))) return NodeFilter.FILTER_REJECT;
+                      var p=n.parentNode;
+                      while(p){ if(SKIP[p.nodeName]) return NodeFilter.FILTER_REJECT; p=p.parentNode; }
+                      return NodeFilter.FILTER_ACCEPT;
+                    }
+                  });
+                  var nodes=[]; while(walker.nextNode()) nodes.push(walker.currentNode);
+                  nodes.forEach(function(n){
+                    var s=n.nodeValue, parent=n.parentNode, out=[], idx=0, m;
+                    var re=/\\$\\$([\\s\\S]+?)\\$\\$|\\\\\\[([\\s\\S]+?)\\\\\\]|\\[([\\s\\S]+?)\\]/g;
+                    while((m=re.exec(s))){
+                      if (m.index>idx) out.push(document.createTextNode(s.slice(idx,m.index)));
+                      var tex=null, ok=true;
+                      if (m[1]!=null){ tex=m[1].trim(); }
+                      else if (m[2]!=null){ tex=m[2].trim(); }
+                      else if (m[3]!=null){
+                        var content=m[3].trim();
+                        ok = isTexLike(content) && boundaryOK(s, m.index, m.index+m[0].length);
+                        if (ok) tex=content;
+                      }
+                      if (tex!=null && ok){
+                        var el=document.createElement('span');
+                        try{ katex.render(tex, el, {displayMode:true, throwOnError:false}); }
+                        catch(e){ el.textContent=m[0]; }
+                        out.push(el);
+                      } else {
+                        out.push(document.createTextNode(m[0]));
+                      }
+                      idx=m.index+m[0].length;
+                    }
+                    if (idx<s.length) out.push(document.createTextNode(s.slice(idx)));
+                    for (var i=0;i<out.length;i++) parent.insertBefore(out[i], n);
+                    parent.removeChild(n);
+                  });
+                }
+                function run(){
+                  var root = document.querySelector('.main-content') || document.body;
+                  renderKatexInText(root);
+                }
+                if (document.readyState === 'loading'){
+                  document.addEventListener('DOMContentLoaded', run);
+                } else {
+                  run();
+                }
+              })();
+            </script>
+          </body>
+          </html>"""
+          import os
+          os.makedirs('site/_layouts', exist_ok=True)
+          with open('site/_layouts/app.html','w',encoding='utf-8') as f:
+              f.write(html)
+          PY
+
+          printf '%s\n' \
+            'title: Euro Macromechanica Backtest' \
+            'theme: jekyll-theme-cayman' \
+            'markdown: kramdown' \
+            'kramdown:' \
+            '  input: GFM' \
+            '  hard_wrap: false' \
+            '  parse_block_html: true' \
+            '  math_engine: null' \
+            > site/_config.yml
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Build Jekyll site
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./site
+          destination: ./_site
+
+      - name: Verify built site
+        run: |
+          find _site -maxdepth 2 -type f | sort
+          test -f _site/index.html
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./_site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+
