@@ -314,6 +314,16 @@ jobs:
           find _site -maxdepth 2 -type f | sort
           test -f _site/index.html
 
+      - name: Publish to Cloudflare Pages
+        uses: cloudflare/pages-action@v1
+        with:
+          apiToken:  ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          projectName: euro-macromechanica-backtest         
+          directory: ./_site               
+          wranglerVersion: '3'
+
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
